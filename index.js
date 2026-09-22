@@ -336,6 +336,112 @@
         return await unzipFirstImage(buf);
     }
 
+    /* ---------- 聊天集成 ---------- */
+
+    var lastGen = { blob: null, prompt: '', seed: 0 };
+
+    function blobToBase64(blob) {
+        return new Promise(function (resolve, reject) {
+            var reader = new FileReader();
+            reader.onload = function () { resolve(String(reader.result).split(',')[1] || ''); };
+            reader.onerror = function () { reject(reader.error || new Error('读取图片数据失败')); };
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    function timestampNow() {
+        var d = new Date();
+        var months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+        var h = d.getHours();
+        var ap = h >= 12 ? 'pm' : 'am'; h = h % 12 || 12;
+        return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear() + ' ' + h + ':' + String(d.getMinutes()).padStart(2, '0') + ap;
+    }
+
+    /** 上传生成的图片并作为一条消息插入当前聊天（复刻宿主 stable-diffusion 扩展的消息结构） */
+    async function sendImageToChat(blob, prompt, seed) {
+        var m = await loadHostModules();
+        var ctx = m.script && typeof m.script.getContext === 'function' ? m.script.getContext() : null;
+        if (!ctx || !Array.isArray(ctx.chat)) throw new Error('宿主聊天上下文不可用');
+        if (typeof ctx.getCurrentChatId === 'function' && !ctx.getCurrentChatId()) throw new Error('当前没有打开的聊天，请先进入一个角色聊天');
+
+        var b64 = await blobToBase64(blob);
+        var upRes = await hostApi('/api/images/upload', {
+            image: b64,
+            format: 'png',
+            ch_name: ctx.groupId ? undefined : (ctx.name2 || undefined),
+            filename: 'NovelAI_' + seed,
+        });
+        if (!upRes.ok) {
+            var t = await upRes.text().catch(function () { return ''; });
+            throw new Error('图片保存失败 HTTP ' + upRes.status + ' ' + String(t).slice(0, 120));
+        }
+        var path = (await upRes.json()).path;
+        if (!path) throw new Error('图片保存失败：宿主未返回路径');
+
+        var message = {
+            name: ctx.groupId ? 'System' : (ctx.name2 || 'NovelAI'),
+            is_user: false,
+            is_system: false,
+            send_date: timestampNow(),
+            mes: prompt,
+            extra: {
+                media: [{ url: path, type: 'image', title: prompt, generation_type: 1, source: 'generated' }],
+                media_display: 'gallery',
+                media_index: 0,
+                inline_image: false,
+            },
+        };
+        ctx.chat.push(message);
+        var messageId = ctx.chat.length - 1;
+        if (ctx.eventSource && ctx.eventTypes) await ctx.eventSource.emit(ctx.eventTypes.MESSAGE_RECEIVED, messageId, 'extension');
+        ctx.addOneMessage(message);
+        if (ctx.eventSource && ctx.eventTypes) await ctx.eventSource.emit(ctx.eventTypes.CHARACTER_MESSAGE_RENDERED, messageId, 'extension');
+        await ctx.saveChat();
+    }
+
+    /** 读取图像生成面板里的参数；面板未打开过时用默认值 */
+    function readPanelOptionsOrDefaults(prompt) {
+        function val(id, d) { var el = document.getElementById('nai_gen_' + id); return el ? el.value : d; }
+        var sizeParts = String(val('size', '832x1216')).split('x');
+        var steps = parseInt(val('steps', '28'), 10) || 28;
+        var guardEl = document.getElementById('nai_gen_guard');
+        if (guardEl && guardEl.checked && steps > 28) steps = 28;
+        return {
+            prompt: prompt,
+            negative: String(val('negative', '') || ''),
+            model: String(val('model', 'nai-diffusion-4-5-full')),
+            width: parseInt(sizeParts[0], 10) || 832,
+            height: parseInt(sizeParts[1], 10) || 1216,
+            steps: steps,
+            scale: parseFloat(val('scale', '5')) || 5,
+            sampler: String(val('sampler', 'k_euler_ancestral')),
+            scheduler: String(val('scheduler', 'karras')),
+            seed: 0,
+        };
+    }
+
+    /** 注册 /nai 斜杠命令：在对话输入框输入 /nai 提示词 即可生图并发送到聊天 */
+    async function registerSlash() {
+        try {
+            var m = await loadHostModules();
+            var ctx = m.script && typeof m.script.getContext === 'function' ? m.script.getContext() : null;
+            var Parser = ctx && ctx.SlashCommandParser;
+            if (!Parser || typeof Parser.addCommand !== 'function') return;
+            Parser.addCommand('nai', async function (args, value) {
+                var prompt = String(value || '').trim();
+                if (!prompt) { toast('warning', '用法：/nai 提示词'); return ''; }
+                toast('info', 'NovelAI 直出：正在生成…');
+                var seed = Math.floor(Math.random() * 4294967295);
+                var opts = readPanelOptionsOrDefaults(prompt);
+                opts.seed = seed;
+                var blob = await generateImage(opts, function () { });
+                await sendImageToChat(blob, prompt, seed);
+                toast('success', '图片已发送到聊天（种子 ' + seed + '）');
+                return '';
+            }, [], '<span class="monospace">/nai 提示词</span> —— 用 NovelAI 生成图片并插入当前聊天（参数沿用图像生成面板的设置）');
+        } catch (e) { console.warn('[NovelAI-Direct] 斜杠命令注册失败', e); }
+    }
+
     /* ---------- UI ---------- */
 
     function injectStyles() {
@@ -499,10 +605,27 @@
                         scheduler: document.getElementById(scope + '_scheduler').value,
                         seed: seed,
                     }, function (t) { progress.textContent = t; });
+                    lastGen = { blob: blob, prompt: prompt, seed: seed };
                     var url = URL.createObjectURL(blob);
                     resultBox.innerHTML =
                         '<img src="' + url + '" alt="生成结果" />' +
-                        '<div><a class="nai-btn" href="' + url + '" download="novelai-' + seed + '.png">下载图片</a></div>';
+                        '<div>' +
+                        '<a class="nai-btn" href="' + url + '" download="novelai-' + seed + '.png">下载图片</a> ' +
+                        '<span class="nai-btn" id="' + scope + '_sendchat" role="button">发送到聊天</span>' +
+                        '</div>';
+                    var sendBtn = document.getElementById(scope + '_sendchat');
+                    sendBtn.addEventListener('click', async function () {
+                        if (!lastGen.blob) { toast('warning', '没有可发送的图片'); return; }
+                        sendBtn.textContent = '正在发送…';
+                        try {
+                            await sendImageToChat(lastGen.blob, lastGen.prompt, lastGen.seed);
+                            sendBtn.textContent = '已发送到聊天 ✔';
+                            toast('success', '图片已插入当前聊天');
+                        } catch (e) {
+                            sendBtn.textContent = '发送到聊天';
+                            toast('error', e.message);
+                        }
+                    });
                     progress.textContent = '完成（种子 ' + seed + '）';
                 } catch (e) {
                     console.error('[NovelAI-Direct] 生成失败', e);
@@ -549,6 +672,7 @@
     injectStyles();
     injectDrawer();
     injectIntoImagePanel();
+    registerSlash();
 
     var observer = new MutationObserver(function () {
         injectDrawer();
