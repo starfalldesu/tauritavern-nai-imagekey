@@ -160,19 +160,50 @@
     }
 
     async function validateKey(keyFromInput) {
-        var key = keyFromInput;
-        if (key) {
-            var saved = await saveKey(key);
+        if (keyFromInput) {
+            var saved = await saveKey(keyFromInput);
             if (!saved) return { ok: false, msg: 'Key 保存失败，无法校验' };
-        } else {
-            key = await readKeyValue();
-            if (!key) return { ok: false, msg: '请先输入或保存 Key' };
+        } else if (!(await hasKey())) {
+            return { ok: false, msg: '请先输入或保存 Key' };
         }
-        var res = await naiFetch(API_SUB, { headers: { 'Authorization': 'Bearer ' + key } });
-        if (res.status === 401) return { ok: false, msg: 'Key 无效（401 Unauthorized）' };
-        if (!res.ok) return { ok: false, msg: 'NovelAI 返回 HTTP ' + res.status };
-        var data = res.data || (typeof res.json === 'function' ? await res.json() : null);
+
+        // 通道一（最可靠）：借道宿主已实现的 NovelAI 语音接口。
+        // 同源请求、由 Rust 端出站、自动带已保存的 Key，不受浏览器 CORS 限制，且不消耗 Anlas。
+        try {
+            var res = await hostApi('/api/novelai/generate-voice', { text: 'a', voice: 'Ligeia' });
+            if (res.ok) {
+                var info = await tryFetchSubscription(keyFromInput);
+                return { ok: true, msg: 'Key 有效（已通过 NovelAI 接口验证）' + (info ? '\n' + info : '') };
+            }
+            if (res.status === 401) return { ok: false, msg: 'Key 无效（NovelAI 返回 401 Unauthorized），请检查是否复制完整' };
+            if (res.status === 403) return { ok: true, msg: 'Key 有效（NovelAI 已受理），但当前账号无语音接口权限——不影响生图' };
+            if (res.status !== 404) {
+                var t = ''; try { t = await res.text(); } catch (e) { /* 忽略 */ }
+                return { ok: false, msg: '宿主通道返回 HTTP ' + res.status + ' ' + String(t).slice(0, 100) };
+            }
+            // 404 = 宿主未实现语音接口，继续走外部通道
+        } catch (e) { console.warn('[NovelAI-Direct] 宿主校验通道不可用', e); }
+
+        // 通道二：反代 / 直连订阅接口（可能被 CORS 或墙拦截）
+        var key = keyFromInput || await readKeyValue();
+        if (!key) return { ok: false, msg: '读取已保存的 Key 失败' };
+        var res2 = await naiFetch(API_SUB, { headers: { 'Authorization': 'Bearer ' + key } });
+        if (res2.status === 401) return { ok: false, msg: 'Key 无效（401 Unauthorized）' };
+        if (!res2.ok) return { ok: false, msg: 'NovelAI 返回 HTTP ' + res2.status };
+        var data = res2.data || (typeof res2.json === 'function' ? await res2.json() : null);
         return { ok: true, msg: parseSubscription(data) };
+    }
+
+    /** 尽力获取订阅信息（档位/Anlas），失败静默返回 null */
+    async function tryFetchSubscription(keyFromInput) {
+        try {
+            var key = keyFromInput || await readKeyValue();
+            if (!key) return null;
+            var res = await naiFetch(API_SUB, { headers: { 'Authorization': 'Bearer ' + key } });
+            if (!res.ok) return null;
+            var data = res.data || (typeof res.json === 'function' ? await res.json() : null);
+            return parseSubscription(data);
+        } catch (e) { return null; }
     }
 
     /* ---------- ZIP 解包（NovelAI 返回 zip 包裹的 png） ---------- */
@@ -259,11 +290,19 @@
         var key = await readKeyValue();
         if (!key) throw new Error('未保存 API Key，请先保存');
         onProgress('正在请求 NovelAI…');
-        var res = await naiFetch(API_IMAGE, {
-            method: 'POST',
-            headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
-            body: JSON.stringify(buildPayload(o)),
-        });
+        var res;
+        try {
+            res = await naiFetch(API_IMAGE, {
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+                body: JSON.stringify(buildPayload(o)),
+            });
+        } catch (e) {
+            if (e && (e.name === 'TypeError' || /failed to fetch|networkerror|cors/i.test(String(e.message)))) {
+                throw new Error('请求被浏览器拦截（CORS 跨域限制）——VPN 解决不了这个问题。请在面板上方填写反代地址后重试（仓库 README 有 3 分钟部署教程），反代同时能绕开墙');
+            }
+            throw e;
+        }
         if (res.status === 401) throw new Error('Key 无效（401）');
         if (res.status === 402) throw new Error('Anlas 余额不足或档位不支持（402）');
         if (!res.ok) {
