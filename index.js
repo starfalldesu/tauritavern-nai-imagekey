@@ -420,6 +420,36 @@
         };
     }
 
+    /* ---------- 对话总结生图 ---------- */
+
+    var SUM_INSTR = 'Below is an excerpt from a roleplay conversation. Summarize the current scene into an image prompt for NovelAI (anime image generator, Danbooru-style tags). Describe: characters (appearance, hair, eyes, clothing), pose, expression, mood, setting and background. Output ONLY comma-separated English tags. No sentences, no explanations, no quotes.\n\nConversation:\n';
+
+    /** 用当前连接的聊天 AI 把最近 N 条对话总结成 NovelAI 提示词 */
+    async function summarizeChat(count) {
+        var m = await loadHostModules();
+        var ctx = m.script && typeof m.script.getContext === 'function' ? m.script.getContext() : null;
+        if (!ctx || !Array.isArray(ctx.chat) || ctx.chat.length === 0) throw new Error('当前聊天为空，没有可总结的内容');
+        if (typeof ctx.generateQuietPrompt !== 'function') throw new Error('宿主不支持静默生成接口');
+
+        var lines = [];
+        var start = Math.max(0, ctx.chat.length - count);
+        for (var i = start; i < ctx.chat.length; i++) {
+            var msg = ctx.chat[i];
+            if (!msg || msg.is_system) continue;
+            var text = String(msg.mes || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+            if (!text) continue;
+            lines.push((msg.is_user ? (ctx.name1 || 'User') : (msg.name || 'Character')) + ': ' + text);
+        }
+        if (!lines.length) throw new Error('最近的消息里没有可总结的文本');
+        var transcript = lines.join('\n');
+        if (transcript.length > 6000) transcript = transcript.slice(-6000);
+
+        var raw = await ctx.generateQuietPrompt(SUM_INSTR + transcript);
+        var prompt = String(raw || '').replace(/["\r\n]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!prompt || prompt.length < 3) throw new Error('聊天 AI 没有返回有效提示词（需已连接聊天模型）');
+        return prompt;
+    }
+
     /** 注册 /nai 斜杠命令：在对话输入框输入 /nai 提示词 即可生图并发送到聊天 */
     async function registerSlash() {
         try {
@@ -524,7 +554,17 @@
                 '<label style="flex-direction:row;align-items:center;gap:.4em;margin-top:1.2em"><input id="' + scope + '_guard" type="checkbox" checked /> Anlas 守护（≤28步 ≤1024×1024）</label>' +
                 '</div>' +
                 '<div class="nai-imgkey-row"><span id="' + scope + '_gen" class="nai-btn nai-btn-primary">生成图片</span><small id="' + scope + '_progress"></small></div>' +
-                '<div id="' + scope + '_result" class="nai-result"></div>';
+                '<div id="' + scope + '_result" class="nai-result"></div>' +
+                '<hr style="opacity:.3" />' +
+                '<b>对话总结生图</b><small style="opacity:.75">（用当前聊天 AI 把上文总结成提示词，再经插件直连生成，不碰酒馆生图后端）</small>' +
+                '<div class="nai-direct-grid" style="margin-top:.4em">' +
+                '<label>取最近消息数<input id="' + scope + '_sumcount" type="number" min="2" max="100" value="' + esc(localStorage.getItem('nai_direct_sumcount') || '15') + '" /></label>' +
+                '<label>附加风格词（可选）<input id="' + scope + '_suffix" type="text" value="' + esc(localStorage.getItem('nai_direct_suffix') || '') + '" placeholder="masterpiece, best quality, ..." /></label>' +
+                '</div>' +
+                '<div class="nai-imgkey-row">' +
+                '<span id="' + scope + '_sum" class="nai-btn">总结为提示词</span>' +
+                '<span id="' + scope + '_sumgen" class="nai-btn nai-btn-primary">总结并直接生成</span>' +
+                '</div>';
         }
 
         wrap.innerHTML = html;
@@ -631,6 +671,40 @@
                     console.error('[NovelAI-Direct] 生成失败', e);
                     progress.textContent = '';
                     resultBox.innerHTML = '<small class="nai-imgkey-status error">✘ ' + esc(e.message) + '\n若提示网络错误：国内直连 NovelAI 被墙，请配置反代地址；若 401：Key 无效；若 402：余额/档位不足。</small>';
+                }
+            });
+
+            /* 对话总结生图 */
+            var doSummarize = async function () {
+                var progress = document.getElementById(scope + '_progress');
+                var count = parseInt(document.getElementById(scope + '_sumcount').value, 10) || 15;
+                var suffix = String(document.getElementById(scope + '_suffix').value || '').trim();
+                localStorage.setItem('nai_direct_sumcount', String(count));
+                localStorage.setItem('nai_direct_suffix', suffix);
+                progress.textContent = '正在总结对话…';
+                var prompt = await summarizeChat(count);
+                if (suffix) prompt += ', ' + suffix;
+                document.getElementById(scope + '_prompt').value = prompt;
+                return prompt;
+            };
+
+            wrap.querySelector('#' + scope + '_sum').addEventListener('click', async function () {
+                try {
+                    await doSummarize();
+                    document.getElementById(scope + '_progress').textContent = '已写入提示词框，可编辑后点「生成图片」';
+                } catch (e) {
+                    document.getElementById(scope + '_progress').textContent = '';
+                    toast('error', '总结失败：' + e.message);
+                }
+            });
+
+            wrap.querySelector('#' + scope + '_sumgen').addEventListener('click', async function () {
+                try {
+                    await doSummarize();
+                    document.getElementById(scope + '_gen').click();
+                } catch (e) {
+                    document.getElementById(scope + '_progress').textContent = '';
+                    toast('error', '总结失败：' + e.message);
                 }
             });
         }
