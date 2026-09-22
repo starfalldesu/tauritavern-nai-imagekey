@@ -8,6 +8,7 @@
     'use strict';
 
     var KEY = 'api_key_novel';
+    var LOCAL_KEY = 'nai_direct_key';
     var LABEL = 'NovelAI（图像生成）';
     var API_IMAGE = 'https://image.novelai.net/ai/generate-image';
     var API_SUB = 'https://api.novelai.net/user/subscription';
@@ -62,26 +63,39 @@
 
     /* ---------- 密钥 ---------- */
 
+    function readLocalKey() {
+        return localStorage.getItem(LOCAL_KEY) || null;
+    }
+
     async function hasKey() {
-        try {
-            var m = await loadHostModules();
-            if (m.secrets && m.secrets.secret_state) {
-                var s = m.secrets.secret_state[KEY];
-                return Array.isArray(s) && s.length > 0;
-            }
-        } catch (e) { /* 走 REST */ }
+        // 服务器事实优先（注意兼容 {states:{...}} 与扁平两种返回结构）
         try {
             var res = await hostApi('/api/secrets/read');
             if (res.ok) {
                 var data = await res.json();
-                var s2 = data && data[KEY];
-                return Array.isArray(s2) && s2.length > 0;
+                var states = (data && data.states && typeof data.states === 'object' && !Array.isArray(data.states)) ? data.states : data;
+                var s = states && states[KEY];
+                if (Array.isArray(s) && s.length > 0) return true;
             }
-        } catch (e) { console.warn('[NovelAI-Direct] 读取密钥状态失败', e); }
-        return false;
+        } catch (e) { console.warn('[NovelAI-Direct] REST 读取密钥状态失败', e); }
+        // 宿主模块状态（先尽力刷新）
+        try {
+            var m = await loadHostModules();
+            if (m.secrets) {
+                if (typeof m.secrets.readSecretState === 'function') await m.secrets.readSecretState();
+                var s2 = m.secrets.secret_state && m.secrets.secret_state[KEY];
+                if (Array.isArray(s2) && s2.length > 0) return true;
+            }
+        } catch (e) { /* 忽略 */ }
+        // 本地副本兜底
+        return !!readLocalKey();
     }
 
     async function readKeyValue() {
+        // 本地副本优先——TauriTavern 默认禁止前端读回密钥值（allowKeysExposure=false），
+        // /api/secrets/find 对 api_key_novel 会 PermissionDenied，所以必须靠自己存的副本。
+        var local = readLocalKey();
+        if (local) return local;
         try {
             var m = await loadHostModules();
             if (m.secrets && typeof m.secrets.findSecret === 'function') {
@@ -89,13 +103,19 @@
                 if (v) return v;
             }
         } catch (e) { /* 走 REST */ }
-        var res = await hostApi('/api/secrets/find', { key: KEY });
-        if (!res.ok) return null;
-        var data = await res.json();
-        return data && data.value ? data.value : null;
+        try {
+            var res = await hostApi('/api/secrets/find', { key: KEY });
+            if (res.ok) {
+                var data = await res.json();
+                if (data && data.value) return data.value;
+            }
+        } catch (e) { /* 忽略 */ }
+        return null;
     }
 
     async function saveKey(value) {
+        // 同时写宿主密钥库（供聊天/语音等官方功能使用）和本地副本（供本插件直连生图使用）
+        localStorage.setItem(LOCAL_KEY, value);
         var m = await loadHostModules();
         if (m.secrets && typeof m.secrets.writeSecret === 'function') {
             var id = await m.secrets.writeSecret(KEY, value, LABEL);
@@ -106,6 +126,7 @@
     }
 
     async function deleteKey() {
+        localStorage.removeItem(LOCAL_KEY);
         var m = await loadHostModules();
         if (m.secrets && typeof m.secrets.deleteSecret === 'function') { await m.secrets.deleteSecret(KEY); return; }
         var res = await hostApi('/api/secrets/delete', { key: KEY });
@@ -288,7 +309,7 @@
 
     async function generateImage(o, onProgress) {
         var key = await readKeyValue();
-        if (!key) throw new Error('未保存 API Key，请先保存');
+        if (!key) throw new Error('插件没有可用的 Key 副本——请在本面板重新粘贴 Key 并点保存（酒馆密钥库默认不允许插件读回 Key 值）');
         onProgress('正在请求 NovelAI…');
         var res;
         try {
