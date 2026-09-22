@@ -1,0 +1,21 @@
+.nai-imgkey-status {
+    display: block;
+    margin: 0.3em 0;
+    opacity: 0.9;
+}
+
+.nai-imgkey-status.saved {
+    color: #6fcf6f;
+}
+
+.nai-imgkey-status.missing {
+    color: #e0a050;
+}
+
+#nai_imgkey_row .menu_button,
+#nai_imgkey_drawer .menu_button {
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 0.4em;
+}
