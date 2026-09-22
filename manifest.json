@@ -1,9 +1,9 @@
 {
-    "display_name": "NovelAI Image Key",
+    "display_name": "NovelAI Image Key & Generator",
     "loading_order": 1,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "author": "custom",
-    "version": "1.2.0"
+    "version": "2.0.0"
 }
